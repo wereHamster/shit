@@ -1,0 +1,327 @@
+#!/usr/bin/env ruby
+
+require 'find'
+require 'net/http'
+require 'pathname'
+require 'tmpdir'
+
+PREFIX = Pathname.new(__FILE__).realpath.dirname.parent
+
+LIBRARY = PREFIX + 'share/shit'
+CACHE = PREFIX + 'var/cache/shit'
+
+module Host
+
+  def self.number_of_processors
+    if RUBY_PLATFORM =~ /linux/
+      cpuinfo = File.read('/proc/cpuinfo')
+      return cpuinfo.scan(/^processor/).length
+    elsif RUBY_PLATFORM =~ /darwin/
+      return `sysctl -n hw.logicalcpu`.to_i
+    else
+      raise "can't determine number of processors on '#{RUBY_PLATFORM}'"
+    end
+  end
+
+end
+
+def setup_build_environment
+  ENV['CPPFLAGS'] = "-I#{PREFIX}/include"
+  ENV['LDFLAGS'] = "-L#{PREFIX}/lib -R#{PREFIX}/lib"
+  ENV['CMAKE_PREFIX_PATH'] = "#{PREFIX}"
+end
+
+def msg(str)
+  len = str.length
+  padding = " " * (80 - len) if len < 80
+  $stdout.write "#{str}#{padding}\n"
+  $stdout.flush
+end
+
+def run(cmd, *args)
+  fork do
+    if false
+      $stdout.close or $stderr.close
+      $stdout = $stderr = File.new('/dev/null', 'w')
+    end
+
+    args.collect!{|arg| arg.to_s}
+    exec(cmd, *args) rescue nil
+    exit! 1 # never gets here unless exec failed
+  end
+
+  Process.wait
+  $?.success?
+end
+
+
+class Source
+
+  def initialize(name, url)
+    @name = name
+    @url = url
+  end
+
+  def filename
+    @filename ||= @url.split('/').last
+  end
+
+  def cache
+    CACHE + filename
+  end
+
+  def extname
+    if filename.match(/(\.tar\.(bz2|gz|xz))$/)
+      return $1
+    else
+      return File.extname(filename)
+    end
+  end
+
+  def basename
+    File.basename(filename, extname)
+  end
+
+  def version
+    if basename.match(/-([rv]?(\d+\.)*\d+.*)$/)
+      return $1
+    end
+  end
+
+  def resolve(url)
+    uri = URI.parse(url)
+    Net::HTTP.start(uri.host, uri.port) do |http|
+      response = http.head(uri.path)
+      case response
+      when Net::HTTPRedirection
+        return resolve(response['Location'])
+      else
+        return uri
+      end
+    end
+  end
+
+  def fetch
+    cache = CACHE + filename
+    return if File.exist?(cache) and File.stat(cache).size > 0
+    message "Downloading #{filename}..."
+
+    begin
+      CACHE.mkpath if not CACHE.exist?
+      file = open(cache, "wb")
+
+      uri = resolve(@url)
+      Net::HTTP.start(uri.host, uri.port) do |http|
+        http.request_get(uri.path) do |response|
+          length = response['content-length'].to_f
+          response.read_body do |segment|
+            file.write(segment)
+            progress = length == 0 ? -1 : file.tell / length * 100
+            message "Downloading #{progress.floor}%"
+          end
+        end
+      end
+    ensure
+      message "Done downloading ..."
+      file.close()
+    end
+  end
+
+  def unpack
+    fetch
+
+    pwd, tmp = Dir.pwd, Pathname.new("#{Dir.tmpdir}/#{basename}")
+
+    tmp.rmtree if tmp.exist?
+    Dir.mkdir(tmp, 0700)
+
+    begin
+      unless tmp.children.length > 0
+        message "Unpacking #{filename} ..."
+        run("tar -xf #{cache} -C #{tmp}")
+      end
+
+      Dir.chdir tmp + basename do
+        yield
+      end
+    ensure
+      tmp.rmtree
+    end
+  end
+
+private
+
+  def message(msg)
+    msg("#{@name}/#{version}: #{msg}")
+  end
+end
+
+
+class Shit
+
+  # Proxy implementing the shit DSL
+  class Proxy
+
+    def initialize(shit)
+      setup_build_environment
+      @shit = shit
+    end
+
+    def message(msg)
+      msg("#{name}/#{version}: #{msg}")
+    end
+
+
+    # Methods forwarded straight to the shit
+    def name
+      @shit.name
+    end
+
+    def version
+      @shit.version
+    end
+
+
+    # Methods specific to the DSL
+    def unpack(url, options = {})
+      pwd = Pathname.pwd
+      Source.new(name, url).unpack do
+        if options[:as]
+          Pathname.pwd.rename(pwd + options[:as])
+        end
+
+        yield if block_given?
+      end
+    end
+
+    def prefix
+      PREFIX + "var/pkg/#{name}/#{version}"
+    end
+
+    def cmake(*args)
+      message "Running cmake ..."
+      run 'cmake', "-DCMAKE_INSTALL_PREFIX=#{prefix}", *args
+    end
+
+    def configure(*args)
+      message "Running ./configure ..."
+      run './configure', "--prefix=#{prefix}", *args
+    end
+
+    def make(*args)
+      message "Running make ..."
+      run 'make', "-j#{Host.number_of_processors}", *args
+    end
+
+    def scons(*args)
+      message "Running scons ..."
+      run 'scons', *args
+    end
+
+  end
+
+  attr_reader :name, :version, :pooper
+
+  def initialize(name, version, pooper)
+    @name = name
+    @version = version
+    @pooper = pooper
+  end
+
+  def poop
+    proxy = Proxy.new(self)
+    proxy.instance_eval &pooper
+  end
+
+end
+
+@SHITPILE = {}
+def poop(name, version, &pooper)
+  @SHITPILE[name] = Shit.new(name, version, pooper)
+end
+
+case arg = ARGV.shift
+when 'install'
+  ARGV.each do |name|
+    require LIBRARY + name
+    @SHITPILE[name].poop
+  end
+when 'link'
+  name = ARGV.shift
+  dir = Pathname.new(PREFIX + "var/pkg/#{name}")
+  if dir.children.length != 1
+    puts "Can't link #{name}, not exactly one version available"
+    exit!
+  end
+
+  dir = dir.children.first
+  unless dir.directory?
+    puts "#{dir} is not a directory"
+    exit!
+  end
+
+  dir.find do |path|
+    rel = path.relative_path_from dir
+    case rel.to_s
+    when 'share/info'
+      Find.prune
+    end
+
+    target = PREFIX + rel
+    if path.directory?
+      target.mkdir rescue nil
+    else
+      begin
+        target.make_link(path)
+      rescue Errno::EEXIST
+        puts "Refusing to overwrite #{target}"
+        exit!
+      end
+    end
+  end
+when 'unlink'
+  name = ARGV.shift
+  version = ARGV.shift
+  dir = Pathname.new(PREFIX + "var/pkg/#{name}/#{version}")
+  unless dir.exist? and dir.directory?
+    puts "#{dir} does not exist"
+    exit!
+  end
+
+  unless dir.parent.parent == PREFIX + 'var/pkg'
+    puts "not a keg"
+    exit!
+  end
+
+  dir.find do |path|
+    rel = path.relative_path_from dir
+    case rel.to_s
+    when 'share/info'
+      Find.prune
+    end
+
+    target = PREFIX + rel
+    puts target
+    if path.directory?
+      if path.children.length == 0
+        target.rmdir
+      end
+    else
+      target.unlink
+    end
+  end
+when 'list'
+  dir = Pathname.new(PREFIX + "var/pkg")
+  dir.children.each do |path|
+    next if not path.directory?
+
+    versions = []
+    path.children.each do |version|
+      versions << version.basename
+    end
+
+    puts "#{path.basename}: #{versions*', '}"
+  end
+else
+  puts "Don't know what to do"
+end
