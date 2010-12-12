@@ -6,24 +6,60 @@ require 'pathname'
 require 'tmpdir'
 
 PREFIX = Pathname.new(__FILE__).realpath.dirname.parent
+LIBRARY, CACHE = PREFIX + 'share/shit', PREFIX + 'var/cache/shit'
 
-LIBRARY = PREFIX + 'share/shit'
-CACHE = PREFIX + 'var/cache/shit'
 
-def msg(str)
-  len = str.length
-  padding = " " * (80 - len) if len < 80
-  $stdout.write "#{str}#{padding}\n"
-  $stdout.flush
+# A stage encapsulates a step during the execution of a command. That can be
+# running shell commands or pure ruby code. A stage has a description and is
+# successful when it does not raise an exception. If it finishes successfully,
+# only its name is printed. If it raises an exception, the step is aborted,
+# all messages generated during the step are printed, and the exception is
+# propagated upwards the call chain.
+class Stage
+
+  def initialize(description, &block)
+    $stdout.write(description)
+    @messages = []
+
+    begin
+      yield(self)
+    rescue Exception => e
+      $stdout.write(" ... failed\n\n#{@messages.join}")
+      raise e
+    else
+      $stdout.write(" ... done\n")
+    end
+  end
+
+  def message(str)
+    @messages.push(str)
+  end
+
+  def run(cmd, *args)
+    rd, wr = IO.pipe
+
+    pid = fork do
+      $stdout.reopen(wr); $stderr.reopen(wr); rd.close
+      exec(cmd, *args.map(&:to_s)) rescue nil
+      exit!(1)
+    end
+
+    wr.close; rd.each {|line| message(line) }
+    Process.waitpid(pid)
+
+    raise "#{cmd} failed (#{$?.to_s})" unless $?.success?
+  end
+
 end
 
+
+# Misc helper methods. Consider putting them into a module or something...
 def number_of_processors
   if RUBY_PLATFORM =~ /linux/
     return File.read('/proc/cpuinfo').scan(/^processor/).length
   elsif RUBY_PLATFORM =~ /darwin/
     return `sysctl -n hw.logicalcpu`.to_i
   else
-    msg "Can't determine number of processors on '#{RUBY_PLATFORM}'"
     return 1
   end
 end
@@ -34,55 +70,39 @@ def setup_build_environment
   ENV['CMAKE_PREFIX_PATH'] = "#{PREFIX}"
 end
 
-def run(cmd, *args)
-  fork do
-    if false
-      $stdout.close or $stderr.close
-      $stdout = $stderr = File.new('/dev/null', 'w')
-    end
 
-    args.collect!{|arg| arg.to_s}
-    exec(cmd, *args) rescue nil
-    exit! 1 # never gets here unless exec failed
-  end
-
-  Process.wait
-  $?.success?
-end
-
-
+# This class represents a particular source file (tarball). An instance is
+# initialized with an url to that source file and has methods to fetch and
+# unpack it. The files are cached on the local filesystem to make repeated
+# installations faster.
 class Source
 
-  def initialize(name, url)
-    @name = name
+  def initialize(shit, url)
+    @shit = shit
     @url = url
   end
 
-  def filename
-    @filename ||= @url.split('/').last
-  end
+  def unpack
+    fetch
 
-  def cache
-    CACHE + filename
-  end
+    begin
+      # This assumes the tarball extracts into a directory with the same name
+      # as the basename of the tarball.
+      tmp = Pathname.new(Dir.tmpdir) + basename
 
-  def extname
-    if filename.match(/(\.tar\.(bz2|gz|xz))$/)
-      return $1
-    else
-      return File.extname(filename)
+      Stage.new("Unpacking #{filename}") do |stage|
+        stage.run("tar", "-xvf", cache, "-C", Dir.tmpdir)
+      end
+
+      Dir.chdir tmp do
+        yield
+      end
+    ensure
+      tmp.rmtree if tmp.exist?
     end
   end
 
-  def basename
-    File.basename(filename, extname)
-  end
-
-  def version
-    if basename.match(/-([rv]?(\d+\.)*\d+.*)$/)
-      return $1
-    end
-  end
+private
 
   def resolve(url)
     uri = URI.parse(url)
@@ -97,59 +117,43 @@ class Source
     end
   end
 
-  def fetch
-    cache = CACHE + filename
-    return if File.exist?(cache) and File.stat(cache).size > 0
-    message "Downloading #{filename}..."
+  def filename
+    @filename ||= @url.split('/').last
+  end
 
-    begin
-      CACHE.mkpath if not CACHE.exist?
+  def extname
+    return $1 if filename.match(/(\.tar\.(bz2|gz|xz))$/)
+    return File.extname(filename)
+  end
+
+  def basename
+    File.basename(filename, extname)
+  end
+
+  def cache
+    @cache ||= CACHE + filename
+  end
+
+  def fetch
+    return if File.exist?(cache) and File.stat(cache).size > 0
+
+    Stage.new("Downloading #{filename}") do
+      CACHE.mkpath unless CACHE.exist?
       file = open(cache, "wb")
 
       uri = resolve(@url)
       Net::HTTP.start(uri.host, uri.port) do |http|
         http.request_get(uri.path) do |response|
-          length = response['content-length'].to_f
           response.read_body do |segment|
             file.write(segment)
-            progress = length == 0 ? -1 : file.tell / length * 100
-            message "Downloading #{progress.floor}%"
           end
         end
       end
-    ensure
-      message "Done downloading ..."
+
       file.close()
     end
   end
 
-  def unpack
-    fetch
-
-    pwd, tmp = Dir.pwd, Pathname.new("#{Dir.tmpdir}/#{basename}")
-
-    tmp.rmtree if tmp.exist?
-    Dir.mkdir(tmp, 0700)
-
-    begin
-      unless tmp.children.length > 0
-        message "Unpacking #{filename} ..."
-        run("tar -xf #{cache} -C #{tmp}")
-      end
-
-      Dir.chdir tmp + basename do
-        yield
-      end
-    ensure
-      tmp.rmtree
-    end
-  end
-
-private
-
-  def message(msg)
-    msg("#{@name}/#{version}: #{msg}")
-  end
 end
 
 
@@ -163,10 +167,6 @@ class Shit
       @shit = shit
     end
 
-    def message(msg)
-      msg("#{name}/#{version}: #{msg}")
-    end
-
 
     # Methods forwarded straight to the shit
     def name
@@ -177,16 +177,20 @@ class Shit
       @shit.version
     end
 
+    def message(msg)
+      @shit.message(msg)
+    end
+
 
     # Methods specific to the DSL
     def unpack(url, options = {})
       pwd = Pathname.pwd
-      Source.new(name, url).unpack do
+      Source.new(@shit, url).unpack do
         if options[:as]
           Pathname.pwd.rename(pwd + options[:as])
         end
 
-        yield if block_given?
+        yield
       end
     end
 
@@ -195,23 +199,27 @@ class Shit
     end
 
     def cmake(*args)
-      message "Running cmake ..."
-      run 'cmake', "-DCMAKE_INSTALL_PREFIX=#{prefix}", *args
+      Stage.new("Running cmake") do |stage|
+        stage.run('cmake', "-DCMAKE_INSTALL_PREFIX=#{prefix}", *args)
+      end
     end
 
     def configure(*args)
-      message "Running ./configure ..."
-      run './configure', "--prefix=#{prefix}", *args
+      Stage.new("Running ./configure") do |stage|
+        stage.run('./configure', "--prefix=#{prefix}", *args)
+      end
     end
 
     def make(*args)
-      message "Running make ..."
-      run 'make', "-j#{number_of_processors}", *args
+      Stage.new("Running make") do |stage|
+        stage.run('make', "-j#{number_of_processors}", *args)
+      end
     end
 
     def scons(*args)
-      message "Running scons ..."
-      run 'scons', *args
+      Stage.new("Running scons") do |stage|
+        stage.run('scons', *args)
+      end
     end
 
   end
@@ -225,99 +233,135 @@ class Shit
   end
 
   def poop
-    proxy = Proxy.new(self)
-    proxy.instance_eval &pooper
+    Proxy.new(self).instance_eval(&pooper)
   end
 
 end
 
-@SHITPILE = {}
+
+# The scripts are simply required and use this method to declare the package.
+# That approach is not ideal because the scripts also have access to all the
+# other methods defined here. But they only should have access to methods
+# declared in the Shit::Proxy class. Fixes are welcome.
 def poop(name, version, &pooper)
-  @SHITPILE[name] = Shit.new(name, version, pooper)
+  Shit.new(name, version, pooper).poop
 end
 
-case arg = ARGV.shift
-when 'install'
-  ARGV.each do |name|
-    require LIBRARY + name
-    @SHITPILE[name].poop
-  end
-when 'link'
-  name = ARGV.shift
-  dir = Pathname.new(PREFIX + "var/pkg/#{name}")
-  if dir.children.length != 1
-    puts "Can't link #{name}, not exactly one version available"
-    exit!
-  end
 
-  dir = dir.children.first
-  unless dir.directory?
-    puts "#{dir} is not a directory"
-    exit!
-  end
+# Main switchboard class, implements all commands we support.
+class Switchboard
 
-  dir.find do |path|
-    rel = path.relative_path_from dir
-    case rel.to_s
-    when 'share/info'
-      Find.prune
+  # Directories to skip when linking the packages into the prefix.
+  SKIPDIRS = [ 'share/info' ]
+
+  def build(opts)
+    ARGV.each do |name|
+      require LIBRARY + name
     end
+  end
 
-    target = PREFIX + rel
-    if path.directory?
-      target.mkdir rescue nil
-    else
-      begin
-        target.make_link(path)
-      rescue Errno::EEXIST
-        puts "Refusing to overwrite #{target}"
-        exit!
+  def help(opts)
+    puts("TODO: write something useful here.\n")
+  end
+
+  def install(opts)
+    build(opts) and link(opts)
+  end
+
+  def link(opts)
+    name = ARGV.shift
+    version = ARGV.shift || latest_version_of(name)
+
+    Stage.new("Linking #{name}/#{version}") do |stage|
+      for_all_files(name, version) do |source, target|
+        stage.message("#{target}\n")
+
+        if source.directory?
+          target.mkdir rescue nil
+        else
+          begin
+            target.make_link(source)
+          rescue Errno::EEXIST
+            raise "Refusing to overwrite #{target}"
+          end
+        end
       end
     end
   end
-when 'unlink'
-  name = ARGV.shift
-  version = ARGV.shift
-  dir = Pathname.new(PREFIX + "var/pkg/#{name}/#{version}")
-  unless dir.exist? and dir.directory?
-    puts "#{dir} does not exist"
-    exit!
-  end
 
-  unless dir.parent.parent == PREFIX + 'var/pkg'
-    puts "not a keg"
-    exit!
-  end
+  def list(opts)
+    Pathname.new(PREFIX + "var/pkg").children.each do |path|
+      next unless path.directory?
 
-  dir.find do |path|
-    rel = path.relative_path_from dir
-    case rel.to_s
-    when 'share/info'
-      Find.prune
-    end
-
-    target = PREFIX + rel
-    puts target
-    if path.directory?
-      if path.children.length == 0
-        target.rmdir
+      versions = path.children.map do |version|
+        version.basename
       end
-    else
-      target.unlink
+
+      puts("#{path.basename}: #{versions.join(', ')}\n")
     end
   end
-when 'list'
-  dir = Pathname.new(PREFIX + "var/pkg")
-  dir.children.each do |path|
-    next if not path.directory?
 
-    versions = []
-    path.children.each do |version|
-      versions << version.basename
+  def unlink(opts)
+    name = ARGV.shift
+    version = ARGV.shift || latest_version_of(name)
+
+    Stage.new("Unlinking #{name}/#{version}") do |stage|
+      for_all_files(name, version) do |source, target|
+        stage.message("#{target}\n")
+
+        if source.directory?
+          if target.exist? && target.children.length == 0
+            target.rmdir
+          end
+        else
+          target.unlink if target.exist?
+        end
+      end
     end
-
-    puts "#{path.basename}: #{versions*', '}"
   end
+
+  def version(opts)
+    puts(`git --git-dir '#{PREFIX}/.git' describe --always`)
+  end
+
+private
+
+  def latest_version_of(name)
+    Pathname.new(PREFIX + "var/pkg/#{name}").children.sort do |a,b|
+      b <=> a
+    end.first.basename
+  end
+
+  def for_all_files(name, version, &block)
+    dir = Pathname.new(PREFIX + "var/pkg/#{name}/#{version}")
+    dir.find do |source|
+      rel = source.relative_path_from(dir)
+      return Find.prune if SKIPDIRS.include?(rel.to_s)
+      yield source, PREFIX + rel
+    end
+  end
+
+end
+
+
+# Parse command and options. Stop at the first non-option argument. All
+# remaining arguments can be used inside the command handler. See 'build'
+# for example.
+cmd, opts = ARGV.shift, {}, {}
+while opt = ARGV.shift
+  if opt =~ /--(.+?)=(.+)/
+    opts[$1] = $2
+  elsif opt =~ /--(.+)/
+    opts[$1] = true
+  else
+    ARGV.unshift(opt) and break
+  end
+end
+
+# And jump to the correct command handler
+case cmd
+when 'build', 'help', 'install', 'link', 'list', 'unlink', 'version'
+  Switchboard.new.send(cmd.to_sym, opts)
 else
-  puts "Don't know what to do"
+  puts("Did not recognize command '#{cmd}', try '#{$0} help'.")
 end
