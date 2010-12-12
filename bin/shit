@@ -10,32 +10,28 @@ PREFIX = Pathname.new(__FILE__).realpath.dirname.parent
 LIBRARY = PREFIX + 'share/shit'
 CACHE = PREFIX + 'var/cache/shit'
 
-module Host
+def msg(str)
+  len = str.length
+  padding = " " * (80 - len) if len < 80
+  $stdout.write "#{str}#{padding}\n"
+  $stdout.flush
+end
 
-  def self.number_of_processors
-    if RUBY_PLATFORM =~ /linux/
-      cpuinfo = File.read('/proc/cpuinfo')
-      return cpuinfo.scan(/^processor/).length
-    elsif RUBY_PLATFORM =~ /darwin/
-      return `sysctl -n hw.logicalcpu`.to_i
-    else
-      raise "can't determine number of processors on '#{RUBY_PLATFORM}'"
-    end
+def number_of_processors
+  if RUBY_PLATFORM =~ /linux/
+    return File.read('/proc/cpuinfo').scan(/^processor/).length
+  elsif RUBY_PLATFORM =~ /darwin/
+    return `sysctl -n hw.logicalcpu`.to_i
+  else
+    msg "Can't determine number of processors on '#{RUBY_PLATFORM}'"
+    return 1
   end
-
 end
 
 def setup_build_environment
   ENV['CPPFLAGS'] = "-I#{PREFIX}/include"
   ENV['LDFLAGS'] = "-L#{PREFIX}/lib -R#{PREFIX}/lib"
   ENV['CMAKE_PREFIX_PATH'] = "#{PREFIX}"
-end
-
-def msg(str)
-  len = str.length
-  padding = " " * (80 - len) if len < 80
-  $stdout.write "#{str}#{padding}\n"
-  $stdout.flush
 end
 
 def run(cmd, *args)
@@ -210,7 +206,7 @@ class Shit
 
     def make(*args)
       message "Running make ..."
-      run 'make', "-j#{Host.number_of_processors}", *args
+      run 'make', "-j#{number_of_processors}", *args
     end
 
     def scons(*args)
