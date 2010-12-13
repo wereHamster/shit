@@ -37,11 +37,15 @@ is not. I trust upstream to do that decision.
 Installing shit
 ===============
 
-Clone to a directory, then add *&lt;prefix&gt;/bin* to your *$PATH* and you can
-start using shit:
+Clone to a directory, then add *&lt;prefix&gt;/bin* to your *$PATH* and you
+can start using shit like this:
 
     $ shit install llvm
-    $ shit link llvm
+
+
+The full list of commands is: help, version, build, link, unlink, list,
+install. The install command is just a convenient wrapper around build and
+link'
 
 
 How it works
