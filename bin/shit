@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 
 require 'find'
-require 'net/http'
+require 'open-uri'
 require 'pathname'
 require 'tmpdir'
 
@@ -104,19 +104,6 @@ class Source
 
 private
 
-  def resolve(url)
-    uri = URI.parse(url)
-    Net::HTTP.start(uri.host, uri.port) do |http|
-      response = http.head(uri.path)
-      case response
-      when Net::HTTPRedirection
-        return resolve(response['Location'])
-      else
-        return uri
-      end
-    end
-  end
-
   def filename
     @filename ||= @url.split('/').last
   end
@@ -141,13 +128,10 @@ private
       CACHE.mkpath unless CACHE.exist?
       file = open(cache, "wb")
 
-      uri = resolve(@url)
-      Net::HTTP.start(uri.host, uri.port) do |http|
-        http.request_get(uri.path) do |response|
-          response.read_body do |segment|
-            file.write(segment)
-          end
-        end
+      open(@url) do |src|
+         while data = src.read(4096)
+           file.write(data)
+         end
       end
 
       file.close()
